@@ -1,0 +1,9 @@
+.venv/
+venv/
+site-packages/
+__pycache__/
+*.pyc
+tmp/
+state.json
+*.zip
+.DS_Store
