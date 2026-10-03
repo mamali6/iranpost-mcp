@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
-"""Iran Post (شرکت ملی پست ایران) tracking MCP server.
+"""Iran Post & Courier tracking MCP server (v2).
+
+Supports Iran Post (پست ایران), Tipax (تیپاکس), Mahex (ماهکس), and Chapar (چاپار)
+via hybrid routing (Rahgir proxy-free gateway + direct tracking.post.ir fallback).
 
 Tools:
-  track(code)        -> رهگیری یک مرسوله از tracking.post.ir
-  track_many(codes)  -> رهگیری چند مرسوله (جدا شده با ویرگول/فاصله)
-  status()           -> وضعیت پروکسی و زیرساخت
+  track(code, courier="auto")             -> رهگیری هوشمند مرسوله (پست، تیپاکس، ماهکس، چاپار)
+  track_tipax(code, search_type="barcode") -> رهگیری مرسوله تیپاکس (بارکد یا شماره قرارداد)
+  track_mahex(code)                       -> رهگیری مرسوله ماهکس با شماره بارنامه
+  track_chapar(code)                      -> رهگیری مرسوله چاپار با شماره پیگیری
+  track_many(codes, courier="auto")       -> رهگیری همزمان چند مرسوله
+  status()                                -> وضعیت زیرساخت‌ها، درگاه رهگیر و کپچاشکن
 
-Notes
------
-tracking.post.ir is geo-restricted to Iran (TCP connects only from Iranian
-IPs; every foreign node times out).  From outside Iran we therefore need an
-Iranian HTTP proxy: a pool is fetched from public lists (ProxyScrape /
-GeoNode, country=IR), probed against the real endpoint, and cached in
-state.json.  When the server runs *inside* Iran the direct path is tried
-first and usually wins.
-
-The search form is protected by a 4-digit ASP.NET captcha.  It is solved
-locally with ddddocr's beta model (bundled under ./site-packages); on a bad
-read we simply fetch a new captcha and retry.
+Architecture:
+  - Fast-path: Uses Rahgir (m.rahgir.app / track.rahgir.app) for fast worldwide
+    access without Iranian proxy requirements (~1.5s latency).
+  - Fallback: tracking.post.ir direct connection (inside Iran) or Iranian HTTP proxy
+    pool (outside Iran).
+  - Captcha solving: Local 4-digit OCR via ddddocr (beta model).
 """
 
 from __future__ import annotations
 
+import base64
+import urllib.request
+import urllib.error
 import concurrent.futures as cf
 import html as html_lib
 import json
@@ -55,6 +58,7 @@ _COUNTER = itertools.count()
 STATE_LOCK = threading.Lock()
 
 _ocr_engine = None
+_ocr_engine_std = None
 _ocr_lock = threading.Lock()
 
 
@@ -165,6 +169,72 @@ def fetch_proxy_candidates() -> list[str]:
         for p in re.split(r"[,\s]+", env):
             if p:
                 found.append(p if "://" in p else "http://" + p)
+
+    # External Iran-specific sources
+    extra_urls = [
+        ("https://raw.githubusercontent.com/ProxyScrape/free-proxy-list/main/proxies/countries/ir/data.csv", "csv"),
+        ("https://daniyal-abbassi.github.io/iran-proxy/proxies.json", "json_abbassi"),
+        ("https://raw.githubusercontent.com/10ium/free-config/main/worker/iran_proxy.txt", "txt_socks5"),
+        ("https://www.freeproxy.world/?country=IR", "freeproxy"),
+        ("https://proxyhub.me/en/ir-free-proxy-list.html", "proxyhub"),
+    ]
+    for url, fmt in extra_urls:
+        tmp = TMP_DIR / f"extra_{fmt}.tmp"
+        rc, code, _ = _curl(url, out=tmp, timeout=12, connect_timeout=6)
+        if rc != 0 or code not in (0, 200) or not tmp.exists():
+            continue
+        try:
+            content = tmp.read_text(encoding="utf-8", errors="ignore")
+            if fmt == "csv":
+                import csv, io
+                reader = csv.reader(io.StringIO(content))
+                for row in reader:
+                    if len(row) >= 3 and row[1] != "ip":
+                        proto, ip, port = row[0].lower(), row[1], row[2]
+                        sch = "socks5h" if "socks5" in proto else "http"
+                        cand = f"{sch}://{ip}:{port}"
+                        if cand not in found:
+                            found.append(cand)
+            elif fmt == "json_abbassi":
+                items = json.loads(content)
+                for item in items:
+                    ip, port = item.get("ip"), item.get("port")
+                    proto = (item.get("protocol") or "http").lower()
+                    sch = "socks5h" if "socks5" in proto else "http"
+                    cand = f"{sch}://{ip}:{port}"
+                    if cand not in found:
+                        found.append(cand)
+            elif fmt == "txt_socks5":
+                for cand in _extract_proxies(content, "socks5h"):
+                    if cand not in found:
+                        found.append(cand)
+            elif fmt == "freeproxy":
+                tr_matches = re.findall(r'<tr>(.*?)</tr>', content, re.S)
+                for tr in tr_matches[1:]:
+                    tds = re.findall(r'<td[^>]*>(.*?)</td>', tr, re.S)
+                    if len(tds) >= 6:
+                        c_tds = [re.sub(r'<[^>]+>', '', td).strip() for td in tds]
+                        ip, port, proto = c_tds[0], c_tds[1], c_tds[5].lower()
+                        if re.fullmatch(r'\d{1,3}(\.\d{1,3}){3}', ip) and port.isdigit():
+                            sch = "socks5h" if "socks5" in proto else ("socks4" if "socks4" in proto else "http")
+                            cand = f"{sch}://{ip}:{port}"
+                            if cand not in found:
+                                found.append(cand)
+            elif fmt == "proxyhub":
+                tr_matches = re.findall(r'<tr>(.*?)</tr>', content, re.S)
+                for tr in tr_matches[1:]:
+                    tds = re.findall(r'<td[^>]*>(.*?)</td>', tr, re.S)
+                    if len(tds) >= 4:
+                        c_tds = [re.sub(r'<[^>]+>', '', td).strip() for td in tds]
+                        ip, port, proto = c_tds[1], c_tds[2], c_tds[3].lower()
+                        if re.fullmatch(r'\d{1,3}(\.\d{1,3}){3}', ip) and port.isdigit():
+                            sch = "socks5h" if "socks5" in proto else ("socks4" if "socks4" in proto else "http")
+                            cand = f"{sch}://{ip}:{port}"
+                            if cand not in found:
+                                found.append(cand)
+        except Exception:
+            pass
+
     for url, scheme in PROXY_SOURCES:
         tmp = TMP_DIR / "proxies.tmp"
         rc, code, _ = _curl(url, out=tmp, timeout=20, connect_timeout=8)
@@ -193,15 +263,15 @@ def fetch_proxy_candidates() -> list[str]:
 def probe_proxy(proxy: str, code: str) -> bool:
     """Fast reachability test: can this proxy complete the real search page?"""
     url = f"{SEARCH_URL}?id={code}"
-    rc, http, body = _curl(url, proxy=proxy, timeout=12, connect_timeout=5)
+    rc, http, body = _curl(url, proxy=proxy, timeout=15, connect_timeout=6)
     if rc != 0 or http != 200:
         return False
-    if isinstance(body, str) and os.path.exists(body):  # out-file form (never here, but safe)
+    if isinstance(body, str) and os.path.exists(body):
         try:
-            return os.path.getsize(body) > 8000
+            return os.path.getsize(body) > 3000
         except Exception:
             return False
-    return isinstance(body, str) and len(body) > 8000
+    return isinstance(body, str) and len(body) > 3000
 
 
 def probe_all(candidates: list[str], code: str, workers: int = 40, budget: float = 55.0) -> list[str]:
@@ -291,13 +361,18 @@ def normalize_captcha(raw: str, expect_len: int = 4) -> str:
 
 
 def solve_captcha(png_bytes: bytes) -> str:
-    global _ocr_engine
+    global _ocr_engine, _ocr_engine_std
     with _ocr_lock:
         if _ocr_engine is None:
             import ddddocr
             _ocr_engine = ddddocr.DdddOcr(show_ad=False, beta=True)
+            _ocr_engine_std = ddddocr.DdddOcr(show_ad=False, beta=False)
         raw = _ocr_engine.classification(png_bytes)
-    return normalize_captcha(raw)
+        ans = normalize_captcha(raw)
+        if not ans:
+            raw_std = _ocr_engine_std.classification(png_bytes)
+            ans = normalize_captcha(raw_std)
+    return ans
 
 
 # --------------------------------------------------------------------------
@@ -319,8 +394,8 @@ def parse_tracking_page(page: str, code: str) -> dict:
         if cut > 0:
             seg = seg[:cut]
 
-    date_re = re.compile(r"<div class='newtdheader col-lg-6[^']*'>(.*?)</div>", re.S)
-    row_start_re = re.compile(r"<div class='row newrowdata'>")
+    date_re = re.compile(r"<div class=['\"]newtdheader col-lg-6[^'\"]*['\"][^>]*>(.*?)</div>", re.S)
+    row_start_re = re.compile(r"<div class=['\"]row newrowdata['\"][^>]*>")
 
     marks: list[tuple[int, str, str]] = []
     for m in date_re.finditer(seg):
@@ -341,8 +416,7 @@ def parse_tracking_page(page: str, code: str) -> dict:
                 end = npos
                 break
         chunk = seg[pos:end]
-        cells = [_clean(c) for c in re.findall(r"<div class='newtddata[^']*'>(.*?)</div>", chunk, re.S)]
-        cells = [c for c in cells if c != ""][:4]
+        cells = [_clean(c) for c in re.findall(r"<div class=['\"]newtddata[^'\"]*['\"][^>]*>(.*?)</div>", chunk, re.S)]
         if len(cells) < 4:
             continue
         idx_no, status, location, clock = cells[0], cells[1], cells[2], cells[3]
@@ -366,7 +440,10 @@ def parse_error(page: str) -> str:
                 r"alert-warning'>(.*?)</div>"):
         m = re.search(pat, page, re.S)
         if m:
-            return _clean(m.group(1))
+            txt = _clean(m.group(1))
+            if "رهگیری مرسوله به شماره" in txt:
+                continue
+            return txt
     return ""
 
 
@@ -398,13 +475,16 @@ def _attempt(code: str, proxy: str | None) -> dict:
     fields = _page_fields(page)
 
     cap_path = TMP_DIR / f"cap_{os.getpid()}_{threading.get_ident()}.png"
-    rc, http, _ = _curl(f"{SEARCH_URL}?captcha=1&t={int(time.time() * 1000)}", proxy=proxy,
-                        cookie=cookie, referer=referer, out=cap_path, timeout=30)
-    if rc != 0 or http != 200 or not cap_path.exists() or cap_path.stat().st_size < 500:
-        raise RuntimeError(f"captcha fetch failed (rc={rc} http={http})")
-
-    png = cap_path.read_bytes()
-    answer = solve_captcha(png)
+    answer = ""
+    for _ in range(4):
+        rc, http, _ = _curl(f"{SEARCH_URL}?captcha=1&t={int(time.time() * 1000)}", proxy=proxy,
+                            cookie=cookie, referer=referer, out=cap_path, timeout=30)
+        if rc != 0 or http != 200 or not cap_path.exists() or cap_path.stat().st_size < 500:
+            continue
+        png = cap_path.read_bytes()
+        answer = solve_captcha(png)
+        if answer:
+            break
     if not answer:
         raise RuntimeError("captcha unreadable")
 
@@ -443,6 +523,146 @@ def _attempt(code: str, proxy: str | None) -> dict:
     raise RuntimeError("empty result")
 
 
+
+# --------------------------------------------------------------------------
+# Rahgir.app integration (fast proxy-free gateway for Post, Tipax, Mahex, Chapar)
+# --------------------------------------------------------------------------
+def track_rahgir_post(code: str, max_retries: int = 4) -> dict:
+    started = time.time()
+    errors: list[str] = []
+
+    for attempt in range(max_retries):
+        try:
+            req_c = urllib.request.Request(
+                "https://track.rahgir.app/post/get_captcha",
+                headers={
+                    "User-Agent": UA,
+                    "Referer": "https://track.rahgir.app/post/",
+                    "Accept": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req_c, timeout=8) as resp:
+                c_data = json.load(resp)
+
+            img_b64 = c_data["image"].split(",", 1)[1]
+            img_bytes = base64.b64decode(img_b64)
+            session_id = c_data["session"]
+
+            clean_code = solve_captcha(img_bytes)
+            if not clean_code:
+                continue
+
+            payload = json.dumps({
+                "trackingCode": code,
+                "captchaCode": clean_code,
+                "captchaSession": session_id,
+            }).encode("utf-8")
+
+            req_t = urllib.request.Request(
+                "https://track.rahgir.app/post/track",
+                data=payload,
+                headers={
+                    "User-Agent": UA,
+                    "Referer": "https://track.rahgir.app/post/",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req_t, timeout=12) as resp:
+                res = json.load(resp)
+                data = res.get("data", {})
+                events = []
+                for ev in (data.get("events") or []):
+                    events.append({
+                        "date": ev.get("date", ""),
+                        "index": ev.get("index", 0),
+                        "status": ev.get("status", ""),
+                        "location": ev.get("location", ""),
+                        "time": ev.get("time", ""),
+                    })
+                return {
+                    "code": code,
+                    "courier": "post",
+                    "events": events,
+                    "parcel_info": data.get("parcel_info", []),
+                    "raw_found": not data.get("empty", False),
+                    "valid": data.get("valid", True),
+                    "empty": data.get("empty", False),
+                    "echoed": True,
+                    "via": "rahgir.app",
+                    "attempts": attempt + 1,
+                    "elapsed_s": round(time.time() - started, 2),
+                }
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="ignore")
+            if "captcha_error" in body:
+                time.sleep(0.2)
+                continue
+            errors.append(f"HTTP {e.code}: {body}")
+        except Exception as e:
+            errors.append(str(e))
+            time.sleep(0.2)
+            continue
+
+    raise RuntimeError(f"rahgir post: {'; '.join(errors[-2:]) or 'retry limit'}")
+
+
+def track_rahgir_courier(courier: str, code: str, search_type: str = "barcode") -> dict:
+    started = time.time()
+    url = f"https://track.rahgir.app/{courier}/track"
+    payload_dict = {"trackingCode": code}
+    if courier == "tipax":
+        payload_dict["searchType"] = search_type
+
+    payload = json.dumps(payload_dict).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "User-Agent": UA,
+            "Referer": f"https://track.rahgir.app/{courier}/",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            res = json.load(resp)
+            data = res.get("data", {})
+            return {
+                "code": code,
+                "courier": courier,
+                "valid": data.get("valid", True),
+                "empty": data.get("empty", False),
+                "parcel_info": data.get("parcel_info", []),
+                "events": data.get("events", []),
+                "via": f"rahgir.app ({courier})",
+                "elapsed_s": round(time.time() - started, 2),
+            }
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        try:
+            err_json = json.loads(body)
+            err_msg = err_json.get("error", body)
+        except Exception:
+            err_msg = body
+        return {
+            "code": code,
+            "courier": courier,
+            "events": [],
+            "error": err_msg,
+            "http_code": e.code,
+            "elapsed_s": round(time.time() - started, 2),
+        }
+    except Exception as e:
+        return {
+            "code": code,
+            "courier": courier,
+            "events": [],
+            "error": str(e),
+            "elapsed_s": round(time.time() - started, 2),
+        }
+
 def track_package(code: str, max_attempts: int = 4) -> dict:
     code = (code or "").strip()
     if not re.fullmatch(r"\d{13}|\d{14}|\d{24}", code):
@@ -451,6 +671,14 @@ def track_package(code: str, max_attempts: int = 4) -> dict:
     started = time.time()
     deadline = started + 150
     errors: list[str] = []
+
+    # 0) Rahgir fast path (proxy-free, worldwide access, 1.5s latency)
+    try:
+        res = track_rahgir_post(code)
+        if res.get("valid") is not False:
+            return res
+    except Exception as exc:
+        errors.append(f"rahgir: {exc}")
 
     # 1) direct (fast path when the server runs inside Iran)
     for attempt in range(max_attempts):
@@ -513,40 +741,90 @@ app = MCPServer(
 )
 
 
-@app.tool(description="رهگیری یک مرسوله پستی با شماره رهگیری 13/14/24 رقمی از tracking.post.ir")
-def track(code: str) -> str:
-    """کد رهگیری پستی را بگیر و آخرین وضعیت مرسوله را برگردان."""
+@app.tool(description="رهگیری هوشمند مرسوله (پست ایران، تیپاکس، ماهکس یا چاپار) با شماره رهگیری")
+def track(code: str, courier: str = "auto") -> str:
+    """کد رهگیری را بگیر و آخرین وضعیت مرسوله را برگردان.
+    courier می‌تواند یکی از این‌ها باشد: auto, post, tipax, mahex, chapar
+    """
+    code = (code or "").strip()
+    courier = (courier or "auto").strip().lower()
     try:
-        result = track_impl(code)
+        if courier in ("tipax", "mahex", "chapar"):
+            result = track_rahgir_courier(courier, code)
+        elif courier == "post":
+            result = track_package(code)
+        else:
+            # auto detection: if code is 13/14/24 digits, likely post
+            if re.fullmatch(r"\d{13}|\d{14}|\d{24}", code):
+                result = track_package(code)
+            else:
+                try:
+                    result = track_package(code)
+                except Exception:
+                    result = track_rahgir_courier("tipax", code)
     except ValueError as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)
-    except Exception as exc:  # pragma: no cover
+    except Exception as exc:
         return json.dumps({"error": f"tracking failed: {exc}"}, ensure_ascii=False)
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
-@app.tool(description="رهگیری چند مرسوله پستی باهم؛ کدها را با ویرگول یا فاصله جدا کن")
-def track_many(codes: str) -> str:
+@app.tool(description="رهگیری مرسوله تیپاکس با شماره بارکد یا شماره قرارداد")
+def track_tipax(code: str, search_type: str = "barcode") -> str:
+    """رهگیری مرسوله تیپاکس. search_type می‌تواند barcode یا contract باشد."""
+    try:
+        result = track_rahgir_courier("tipax", code.strip(), search_type=search_type)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@app.tool(description="رهگیری مرسوله ماهکس با شماره بارنامه")
+def track_mahex(code: str) -> str:
+    """رهگیری مرسوله ماهکس."""
+    try:
+        result = track_rahgir_courier("mahex", code.strip())
+    except Exception as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@app.tool(description="رهگیری مرسوله چاپار با شماره پیگیری")
+def track_chapar(code: str) -> str:
+    """رهگیری مرسوله چاپار."""
+    try:
+        result = track_rahgir_courier("chapar", code.strip())
+    except Exception as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@app.tool(description="رهگیری چند مرسوله باهم؛ کدها را با ویرگول یا فاصله جدا کن")
+def track_many(codes: str, courier: str = "auto") -> str:
     parts = [p for p in re.split(r"[,\s;]+", codes or "") if p]
     if not parts:
         return json.dumps({"error": "no codes given"}, ensure_ascii=False)
     out = []
     for c in parts[:5]:
         try:
-            out.append(track_impl(c))
+            if courier in ("tipax", "mahex", "chapar"):
+                out.append(track_rahgir_courier(courier, c))
+            else:
+                out.append(track_package(c))
         except Exception as exc:
             out.append({"code": c, "error": str(exc)})
     return json.dumps(out, ensure_ascii=False, indent=2)
 
 
-@app.tool(description="وضعیت زیرساخت رهگیری: تعداد پروکسی‌های ایرانی کارآمد و زمان آخرین بررسی")
+@app.tool(description="وضعیت زیرساخت‌های رهگیری: رهگیر، پروکسی‌های ایرانی و کپچاشکن")
 def status() -> str:
     state = load_state()
     checked = state.get("checked_at") or 0
     return json.dumps({
-        "site": SITE,
-        "geo_restricted_to_iran": True,
-        "cached_proxies": len(state.get("proxies") or []),
+        "rahgir_gateway": "https://m.rahgir.app (active, proxy-free)",
+        "supported_couriers": ["post", "tipax", "mahex", "chapar"],
+        "post_direct_site": SITE,
+        "cached_iranian_proxies": len(state.get("proxies") or []),
         "last_proxy_check": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(checked)) if checked else None,
         "captcha_solver": "ddddocr(beta) local",
     }, ensure_ascii=False, indent=2)
